@@ -10,14 +10,12 @@
 #include <linux/delay.h>
 #include <linux/jiffies.h>
 
+#include "hids.h"
 #include "commands.h"
 #include "packet.h"
 #include "procon-print.h"
 #include "procon-controller.h"
 #include "procon-input.h"
-
-#define ID_PROCON 0x2009
-#define VENDOR_NINTENDO 0x057e
 
 static unsigned int MAX_SUBCMD_RATE_MS = 50;
 static bool free_players[] = {true, true, true, true};
@@ -130,6 +128,7 @@ int procon_init_device(struct hid_device *hdev, const struct hid_device_id *id) 
     int player_id = get_next_free_player();
 
     __u8 handshake[] = {0x80, 0x02};
+    __u8 baudrate_increase[] = {0x80, 0x03};
     __u8 report_mode_args[] = {0x30};
 
     __u8 disable_arg[] = {0x00};
@@ -181,6 +180,14 @@ int procon_init_device(struct hid_device *hdev, const struct hid_device_id *id) 
     hid_set_drvdata(hdev, c);
 
     // Perform handshake.
+    ret = send_message_raw(hdev, handshake, sizeof(handshake));
+    mdelay(MAX_SUBCMD_RATE_MS);
+
+    // Increase baudrate
+    ret = send_message_raw(hdev, baudrate_increase, sizeof(baudrate_increase));
+    mdelay(MAX_SUBCMD_RATE_MS);
+
+    // Handshake again.
     ret = send_message_raw(hdev, handshake, sizeof(handshake));
     mdelay(MAX_SUBCMD_RATE_MS);
 
@@ -326,7 +333,7 @@ void procon_remove_device(struct hid_device *hdev) {
 }
 
 static const struct hid_device_id procon_devices[] = {
-    { HID_BLUETOOTH_DEVICE(VENDOR_NINTENDO, ID_PROCON) },
+    { HID_BLUETOOTH_DEVICE(VENDOR_NINTENDO, DEVICE_PROCON) },
     { }
 };
 MODULE_DEVICE_TABLE(hid, procon_devices);
