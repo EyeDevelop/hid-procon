@@ -65,11 +65,36 @@ struct input_response {
     __u8 subcommand_reply[35];
 };
 
+enum controller_type {
+    LEFT_JOYCON = 1,
+    RIGHT_JOYCON = 2,
+    PROCON = 3,
+};
+
+struct controller_info {
+    __u8 firmware_version_major;
+    __u8 firmware_version_minor;
+    enum controller_type controller_type;
+    __u8 *controller_mac_addr; // Has length 6.
+    __u8 low_power_mode;
+    __u8 colour_mode;
+};
+
 // Functions.
-void init_packet(struct packet *p, __u8 command, __u8 subcommand, __u8 *args, size_t args_len);
+void init_packet(struct packet *p, const __u8 command, const __u8 subcommand, const __u8 *args, const size_t args_len);
 
 void packet_add_rumble(struct packet *p);
 
-int decode_message(struct input_response *resp, __u8 *resp_data, size_t len);
+int decode_spi_read(__u8 *buf, const __u8 *data, const size_t len);
+
+int decode_message(struct input_response *resp, const __u8 *resp_data, const size_t len);
+
+int decode_device_information(struct controller_info *resp, const __u8 *data, const size_t len);
+
+char *format_controller_type(const enum controller_type type);
+
+char *format_lpm(const __u8 low_power_mode);
+
+char *format_colour_mode(const __u8 colour_mode);
 
 #endif

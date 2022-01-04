@@ -9,6 +9,8 @@
 #include <linux/string.h>
 #include <linux/delay.h>
 #include <linux/jiffies.h>
+#include <linux/proc_fs.h>
+#include <linux/mutex.h>
 
 #include "hids.h"
 #include "commands.h"
@@ -16,9 +18,19 @@
 #include "procon-print.h"
 #include "procon-controller.h"
 #include "procon-input.h"
+#include "util.h"
 
-static unsigned int MAX_SUBCMD_RATE_MS = 50;
-static bool free_players[] = {true, true, true, true};
+#define MAX_CONTROLLER_SUPPORT 4
+#define MAX_LIGHT_SUPPORT 4
+#define CHARS_NEEDED_FOR_CONTROLLER_ID 1
+
+static unsigned int MAX_SUBCMD_RATE_MS = 70;
+
+static bool controller_spots[MAX_CONTROLLER_SUPPORT] = {true};
+struct controller *connected_controllers[MAX_CONTROLLER_SUPPORT] = {NULL, NULL, NULL, NULL};
+
+struct proc_dir_entry *procon_proc_dir = NULL;
+struct proc_dir_entry *procon_player_dirs[MAX_CONTROLLER_SUPPORT] = {NULL, NULL, NULL, NULL};
 
 void enforce_baudrate(struct controller *c) {
     unsigned int current_ms = jiffies_to_msecs(jiffies);
@@ -33,18 +45,18 @@ void enforce_baudrate(struct controller *c) {
 	c->time_last_cmd_sent = current_ms;
 }
 
-int get_next_free_player(void) {
-    for (int i = 0; i < sizeof(free_players); i++) {
-        if (free_players[i]) {
-            free_players[i] = false;
-            return i + 1;
+int get_next_free_controller(void) {
+    for (int i = 0; i < MAX_CONTROLLER_SUPPORT; i++) {
+        if (controller_spots[i]) {
+            controller_spots[i] = false;
+            return i;
         }
     }
 
     return -1;
 }
 
-__u8 get_player_led(__u8 player_id) {
+__u8 get_player_led_arg(__u8 player_id) {
     switch (player_id) {
         case 1:
         return PROCON_LED_ON_1;
@@ -87,6 +99,7 @@ int send_message_raw(struct hid_device *hdev, __u8 *data, size_t len) {
 
 int send_message(struct controller *c, struct packet *p) {
     size_t len = 0x40;
+    int ret = 0;
 
     // Set the packet number.
     p->packet_num = c->current_packet_num++;
@@ -102,15 +115,21 @@ int send_message(struct controller *c, struct packet *p) {
     // Wait until we can send.
     enforce_baudrate(c);
 
-    // Convert the packet to a u8 array and send the raw message.
-    return send_message_raw(c->handler, (__u8*) p, 0x40);
+    // Wait a bit longer if the mutex is locked.
+    mutex_lock(&c->lock);
+
+    ret = send_message_raw(c->handler, (__u8*) p, len);
+
+    // Unlock the mutex and return.
+    mutex_unlock(&c->lock);
+    return ret;
 }
 
-int set_player_light(struct controller *c, __u8 led_information) {
+int set_player_led(struct controller *c, __u8 led_information) {
     int ret;
     struct packet p;
 
-    __u8 light_arg[] = {led_information};
+    __u8 light_arg[1] = {led_information};
     init_packet(&p, PROCON_CMD_COMMAND_AND_RUMBLE, PROCON_SUB_SET_LIGHT, light_arg, sizeof(light_arg));
     
     ret = send_message(c, &p);
@@ -121,24 +140,323 @@ int set_player_light(struct controller *c, __u8 led_information) {
     return 0;
 }
 
+int procon_proc_init(struct inode *file_info, struct file *file) {
+    int controller_id = -1;
+    const unsigned char *path = file->f_path.dentry->d_parent->d_name.name;
+    struct controller *c;
+
+    // Try to get the connected controller id form the proc file path.
+    // This should work, since the proc files are created in the form:
+    // /proc/procon/player<n>/<file>
+    if (sscanf(path, "controller%d", &controller_id) == 0) {
+        pr_err("Could not get controller id from path: %s\n", path);
+        return 1;
+    }
+
+    // Check if player within limits.
+    if (controller_id >= MAX_CONTROLLER_SUPPORT || controller_id < 0) {
+        pr_err("Wrong controller id (%d) in file: %s\n", controller_id, path);
+        return 1;
+    }
+
+    if (connected_controllers[controller_id] == NULL) {
+        pr_err("Controller %d no longer connected!\n", controller_id);
+        return 1;
+    }
+
+    c = connected_controllers[controller_id];
+    mutex_lock(&c->proc_lock);
+
+    // Set private data to be used in further functions.
+    file->private_data = connected_controllers[controller_id];
+
+    return 0;
+}
+
+int procon_proc_exit(struct inode *file_info, struct file *file) {
+    struct controller* c;
+
+    if (file->private_data == NULL) {
+        pr_err("Private data not set!\n");
+        return 1;
+    }
+
+    c = (struct controller*) file->private_data;
+
+    mutex_unlock(&c->proc_lock);
+    return 0;
+}
+
+ssize_t procon_proc_get_player_led(struct file *file, char __user *buffer, size_t len, loff_t *offset) {
+    struct controller *c;
+    char player_indicator[3];
+
+    if ((int) (*offset) >= sizeof(player_indicator)) {
+        return 0;
+    }
+
+    if (file->private_data == NULL) {
+        pr_err("Private data not set!\n");
+        return 0;
+    }
+
+    c = (struct controller*) file->private_data;
+    snprintf(player_indicator, sizeof(player_indicator), "%d\n", c->player_indicator);
+
+    if (copy_to_user(buffer, player_indicator, sizeof(player_indicator))) {
+        pr_err("Failed writing player_id!\n");
+        return 0;
+    }
+
+    *offset = sizeof(player_indicator);
+    return sizeof(player_indicator);
+}
+
+ssize_t procon_proc_set_player_led(struct file *file, const char __user *buffer, size_t len, loff_t *offset) {
+    struct controller *c;
+    char player_indicator[2];
+    int player_led = 0;
+
+    if ((int) (*offset) >= sizeof(player_indicator)) {
+        return 0;
+    }
+
+    if (file->private_data == NULL) {
+        pr_err("Private data not set!\n");
+        return 0;
+    }
+
+    c = (struct controller*) file->private_data;
+    
+    if (copy_from_user(player_indicator, buffer, sizeof(player_indicator))) {
+        pr_err("Failed reading from user!\n");
+        return 0;
+    }
+
+    if (sscanf(player_indicator, "%d", &player_led) == 0) {
+        return 0;
+    }
+
+    if (player_led < 0 || player_led > MAX_LIGHT_SUPPORT) {
+        return 0;
+    }
+
+    if (set_player_led(c, get_player_led_arg(player_led))) {
+        pr_err("Could not set LED.\n");
+        return sizeof(player_indicator);
+    }
+
+    c->player_indicator = player_led;
+
+    *offset = sizeof(player_indicator);
+    return sizeof(player_indicator);
+}
+
+void procon_proc_create_player_indicator(int controller_id) {
+    static struct proc_ops ops = {
+        .proc_open = procon_proc_init,
+        .proc_release = procon_proc_exit,
+        .proc_read = procon_proc_get_player_led,
+        .proc_write = procon_proc_set_player_led,
+    };
+
+    struct proc_dir_entry *proc_entry;
+
+    proc_entry = proc_create("led", 0666, procon_player_dirs[controller_id], &ops);
+    if (proc_entry == NULL) {
+        pr_err("Cannot create led proc file!\n");
+        return;
+    }
+}
+
+ssize_t procon_proc_get_low_power_mode(struct file *file, char __user *buffer, size_t len, loff_t *offset) {
+    struct controller *c;
+    char low_power_mode[3];
+
+    if ((int) (*offset) >= sizeof(low_power_mode)) {
+        return 0;
+    }
+
+    if (file->private_data == NULL) {
+        pr_err("Private data not set!\n");
+        return 0;
+    }
+
+    c = (struct controller*) file->private_data;
+    snprintf(low_power_mode, sizeof(low_power_mode), "%d\n", c->info->low_power_mode);
+
+    if (copy_to_user(buffer, low_power_mode, sizeof(low_power_mode))) {
+        pr_err("Failed writing low power mode!\n");
+        return 0;
+    }
+
+    *offset = sizeof(low_power_mode);
+    return sizeof(low_power_mode);
+}
+
+ssize_t procon_proc_set_low_power_mode(struct file *file, const char __user *buffer, size_t len, loff_t *offset) {
+    struct controller *c;
+    __u8 lpm_set_args[1] = {0};
+    __u8 lpm_read_args[] = {0x00, 0x50, 0x00, 0x00, 0x01};
+    int enable = 0;
+    char buf[2] = {0};
+    struct packet p;
+
+    if ((int) (*offset) >= sizeof(buf)) {
+        return 0;
+    }
+
+    if (file->private_data == NULL) {
+        pr_err("Private data not set!\n");
+        return 0;
+    }
+
+    c = (struct controller*) file->private_data;
+
+    // Copy the user buffer to our buffer and convert to an unsigned integer.
+    if (copy_from_user(buf, buffer, sizeof(buf))) {
+        pr_err("Cannot read data from user!\n");
+        return 0;
+    }
+
+    // Check if user actually sent an int.
+    if (sscanf(buf, "%d", &enable) == 0) {
+        return 0;
+    }
+
+    lpm_set_args[0] = enable == 1 ? 0x1 : 0x0;
+
+    // Send new lower power mode to controller.
+    init_packet(&p, PROCON_CMD_COMMAND_AND_RUMBLE, PROCON_SUB_SET_POWER_STATE, lpm_set_args, sizeof(lpm_set_args));
+    send_message(c, &p);
+
+    // Also request new controller info.
+    init_packet(&p, PROCON_CMD_COMMAND_AND_RUMBLE, PROCON_SUB_READ_SPI, lpm_read_args, sizeof(lpm_read_args));
+    send_message(c, &p);
+
+    *offset = sizeof(buf);
+    return sizeof(buf);
+}
+
+void procon_proc_create_low_power_mode(int controller_id) {
+    static struct proc_ops ops = {
+        .proc_open = procon_proc_init,
+        .proc_release = procon_proc_exit,
+        .proc_read = procon_proc_get_low_power_mode,
+        .proc_write = procon_proc_set_low_power_mode,
+    };
+
+    struct proc_dir_entry *proc_entry;
+
+    proc_entry = proc_create("lpm", 0666, procon_player_dirs[controller_id], &ops);
+    if (proc_entry == NULL) {
+        pr_err("Cannot create low power mode proc file!\n");
+        return;
+    }
+}
+
+ssize_t procon_proc_get_controller_info(struct file *file, char __user *buffer, size_t len, loff_t *offset) {
+    struct controller *c;
+    const char fmt[] = "Device information\n\nPlayer LED: %d\nFirmware: %d.%d\nType: %s\nMAC: %s\nLPM: %s\nCM: %s\n";
+
+    // Ret has size of the base format, plus the extremes for each of the format values.
+    // CHARS_NEEDED_FOR_CONTROLLER_ID, for Player LED.
+    // 7 (xxx.xxx), for major.minor
+    // 12 (Right JoyCon), for type
+    // 17, for MAC address
+    // 8 (disabled), for LPM
+    // 7 (default), for CM.
+    // 1 for \00.
+    char ret[sizeof(fmt) + CHARS_NEEDED_FOR_CONTROLLER_ID + 7 + 12 + 17 + 8 + 7 + 1] = {0};
+    char *mac;
+    char *controller_type;
+    char *lpm;
+    char *colour_mode;
+
+    if ((int) (*offset) >= sizeof(ret)) {
+        return 0;
+    }
+
+    if (file->private_data == NULL) {
+        pr_err("Private data not set!\n");
+        return 0;
+    }
+
+    c = (struct controller*) file->private_data;
+
+    mac = format_mac_addr(c->info->controller_mac_addr);
+    if (mac == NULL) {
+        return 0;
+    }
+
+    controller_type = format_controller_type(c->info->controller_type);
+    if (controller_type == NULL) {
+        return 0;
+    }
+
+    lpm = format_lpm(c->info->low_power_mode);
+    if (lpm == NULL) {
+        return 0;
+    }
+
+    colour_mode = format_colour_mode(c->info->colour_mode);
+    if (colour_mode == NULL) {
+        return 0;
+    }
+
+    snprintf(ret, sizeof(ret), fmt, c->player_indicator, c->info->firmware_version_major, c->info->firmware_version_minor, controller_type, mac, lpm, colour_mode);
+
+    // Free all used variables.
+    kfree(mac);
+    kfree(controller_type);
+    kfree(lpm);
+    kfree(colour_mode);
+
+    if(copy_to_user(buffer, ret, sizeof(ret))) {
+        pr_err("Failed writing device information!\n");
+        return 0;
+    }
+    
+    *offset = sizeof(ret);
+    return sizeof(ret);
+}
+
+void procon_proc_create_info(int controller_id) {
+    static struct proc_ops ops = {
+        .proc_open = procon_proc_init,
+        .proc_release = procon_proc_exit,
+        .proc_read = procon_proc_get_controller_info,
+    };
+
+    struct proc_dir_entry *proc_entry;
+
+    proc_entry = proc_create("info", 0444, procon_player_dirs[controller_id], &ops);
+    if (proc_entry == NULL) {
+        pr_err("Cannot create device info proc file!\n");
+        return;
+    }
+}
+
 int procon_init_device(struct hid_device *hdev, const struct hid_device_id *id) {
     int ret;
 
     struct controller *c;
-    int player_id = get_next_free_player();
+    int controller_id = get_next_free_controller();
 
     __u8 handshake[] = {0x80, 0x02};
     __u8 baudrate_increase[] = {0x80, 0x03};
+    __u8 lpm_read_args[] = {0x00, 0x50, 0x00, 0x00, 0x01};
     __u8 report_mode_args[] = {0x30};
 
     __u8 disable_arg[] = {0x00};
     __u8 enable_arg[] = {0x01};
 
     struct packet p;
+    char* controller_name;
 
-    // Check if there is a player slot available.
-    if (player_id == -1) {
-        pr_err("There are already 4 controllers connected!");
+    // Check if there is a controller slot available.
+    if (controller_id == -1) {
+        pr_err("Driver does not support more than %d controllers!", MAX_CONTROLLER_SUPPORT);
         ret = -1;
         goto err_ret;
     }
@@ -169,30 +487,39 @@ int procon_init_device(struct hid_device *hdev, const struct hid_device_id *id) 
 
     // Initialise controller struct.
     c = devm_kzalloc(&hdev->dev, sizeof(struct controller), GFP_KERNEL);
-    if (c == NULL) {
-        free_players[player_id - 1] = true;
+    mutex_init(&c->lock);
+    mutex_init(&c->proc_lock);
+    mutex_init(&c->input_lock);
+    c->info = devm_kzalloc(&hdev->dev, sizeof(struct controller_info), GFP_KERNEL);
+    c->info->controller_mac_addr = devm_kzalloc(&hdev->dev, 6 * sizeof(__u8), GFP_KERNEL);
+
+    if (c == NULL || c->info == NULL || c->info->controller_mac_addr == NULL) {
+        controller_spots[controller_id] = true;
         return -ENOMEM;
     }
 
-    c->player_id = player_id;
+    c->controller_id = controller_id;
+    c->player_indicator = 0;
     c->current_packet_num = 0;
     c->handler = hdev;
     hid_set_drvdata(hdev, c);
+    connected_controllers[controller_id] = c;
 
     // Perform handshake.
-    ret = send_message_raw(hdev, handshake, sizeof(handshake));
+    mutex_lock(&c->lock);
+    send_message_raw(hdev, handshake, sizeof(handshake));
     mdelay(MAX_SUBCMD_RATE_MS);
 
     // Increase baudrate
-    ret = send_message_raw(hdev, baudrate_increase, sizeof(baudrate_increase));
+    send_message_raw(hdev, baudrate_increase, sizeof(baudrate_increase));
     mdelay(MAX_SUBCMD_RATE_MS);
 
     // Handshake again.
-    ret = send_message_raw(hdev, handshake, sizeof(handshake));
+    send_message_raw(hdev, handshake, sizeof(handshake));
     mdelay(MAX_SUBCMD_RATE_MS);
+    mutex_unlock(&c->lock);
 
     // First ask the controller for its info.
-    pr_info("Asking controller for info...\n");
     init_packet(&p, PROCON_CMD_COMMAND_AND_RUMBLE, PROCON_SUB_REQUEST_INFO, NULL, 0);
     
     ret = send_message(c, &p);
@@ -201,18 +528,16 @@ int procon_init_device(struct hid_device *hdev, const struct hid_device_id *id) 
         goto err_close;
     }
 
-    // Set the shipment low power state.
-    pr_info("Setting controller low power state...\n");
-    init_packet(&p, PROCON_CMD_COMMAND_AND_RUMBLE, PROCON_SUB_SET_POWER_STATE, disable_arg, sizeof(disable_arg));
+    // Fetch LPM mode.
+    init_packet(&p, PROCON_CMD_COMMAND_AND_RUMBLE, PROCON_SUB_READ_SPI, lpm_read_args, sizeof(lpm_read_args));
 
     ret = send_message(c, &p);
     if (ret < 0) {
-        pr_err("Failed to set low power state: %d.\n", ret);
+        pr_err("Failed to read LPM information: %d.\n", ret);
         goto err_close;
     }
 
     // Set input report mode to full reporting mode.
-    pr_info("Setting input report mode...\n");
     init_packet(&p, PROCON_CMD_COMMAND_AND_RUMBLE, PROCON_SUB_SET_REPORT_MODE, report_mode_args, sizeof(report_mode_args));
     packet_add_rumble(&p);
 
@@ -225,10 +550,9 @@ int procon_init_device(struct hid_device *hdev, const struct hid_device_id *id) 
     // Send a vibrate command.
     init_packet(&p, PROCON_CMD_RUMBLE, 0, NULL, 0);
     packet_add_rumble(&p);
-    ret = send_message(c, &p);
+    send_message(c, &p);
 
     // Disable the IMU.
-    pr_info("Disabling IMU...\n");
     init_packet(&p, PROCON_CMD_COMMAND_AND_RUMBLE, PROCON_SUB_SET_IMU, disable_arg, sizeof(disable_arg));
 
     ret = send_message(c, &p);
@@ -238,7 +562,6 @@ int procon_init_device(struct hid_device *hdev, const struct hid_device_id *id) 
     }
 
     // Enable vibration.
-    pr_info("Disabling vibration...\n");
     init_packet(&p, PROCON_CMD_COMMAND_AND_RUMBLE, PROCON_SUB_SET_VIBRATION, disable_arg, sizeof(disable_arg));
 
     ret = send_message(c, &p);
@@ -248,8 +571,7 @@ int procon_init_device(struct hid_device *hdev, const struct hid_device_id *id) 
     }
 
     // Set the player light.
-    pr_info("Setting player %d light...\n", c->player_id);
-    set_player_light(c, get_player_led(c->player_id));
+    set_player_led(c, get_player_led_arg(c->player_indicator));
 
     // Create input device for the controller.
     ret = create_input_device(c);
@@ -258,13 +580,38 @@ int procon_init_device(struct hid_device *hdev, const struct hid_device_id *id) 
         goto err_close;
     }
 
+    // Create a proc folder for settings for this device.
+    controller_name = devm_kzalloc(&hdev->dev, 12, GFP_KERNEL);
+    if (controller_name == NULL) {
+        return -ENOMEM;
+    }
+
+    snprintf(controller_name, 12, "controller%d", controller_id);
+
+    if (procon_proc_dir == NULL) {
+        pr_warn("Not creating proc entries, parent is null.\n");
+        return 0;
+    }
+
+    procon_player_dirs[controller_id] = proc_mkdir(controller_name, procon_proc_dir);
+    if (procon_player_dirs[controller_id] == NULL) {
+        pr_warn("Not creating proc entires, player folder is null.\n");
+        return 0;
+    }
+
+    procon_proc_create_player_indicator(controller_id);
+    procon_proc_create_info(controller_id);
+    procon_proc_create_low_power_mode(controller_id);
+
+    pr_info("Device %s [%02x:%02x] successfully connected as id controller%d!\n", hdev->name, hdev->vendor, hdev->product, controller_id);
+
     return 0;
 
 err_close:
     hid_hw_close(hdev);
 err_stop:
     hid_hw_stop(hdev);
-    free_players[player_id - 1] = true;
+    controller_spots[controller_id] = true;
 err_ret:
     return ret;
 }
@@ -278,6 +625,21 @@ int procon_event(struct hid_device *hdev, struct hid_report *report, __u8 *raw_d
 
     // Decode the controller message.
     decode_message(&resp, raw_data, size);
+
+    if (resp.subcommand_id == 0x02) {
+        mutex_lock(&c->lock);
+        decode_device_information(c->info, resp.subcommand_reply, 12);
+        mutex_unlock(&c->lock);
+    } else if (resp.subcommand_id == 0x10) {
+        __u8 buf[0x1d] = {0};
+        decode_spi_read(buf, resp.subcommand_reply, 0x1d);
+
+        mutex_lock(&c->lock);
+        c->info->low_power_mode = buf[0] == 0x1 ? 1 : 0;
+        mutex_unlock(&c->lock);
+    }
+
+    mutex_lock(&c->input_lock);
 
     // Full input report. Pass this to the input device.
     if (c->input != NULL && (resp.report_id == 0x30 || resp.report_id == 0x21)) {
@@ -315,6 +677,8 @@ int procon_event(struct hid_device *hdev, struct hid_report *report, __u8 *raw_d
 
         input_sync(c->input);
     }
+
+    mutex_unlock(&c->input_lock);
     
     return 0;
 }
@@ -322,18 +686,27 @@ int procon_event(struct hid_device *hdev, struct hid_report *report, __u8 *raw_d
 void procon_remove_device(struct hid_device *hdev) {
     struct controller *c = (struct controller*) hid_get_drvdata(hdev);
 
-    pr_info("Device removed: %s [%x:%x] [player %d].\n", hdev->name, hdev->vendor, hdev->product, c->player_id);
-
-    if (c != NULL && c->player_id > 0 && c->player_id <= 4) {
-        free_players[c->player_id - 1] = true;
+    if (c == NULL) {
+        goto close;
     }
 
+    // Remove proc entries.
+    if (c->controller_id >= 0 && c->controller_id < MAX_CONTROLLER_SUPPORT && procon_player_dirs[c->controller_id] != NULL) {
+        proc_remove(procon_player_dirs[c->controller_id]);
+        controller_spots[c->controller_id] = true;
+    }
+
+    pr_info("Device removed: %s [%02x:%02x] [controller%d].\n", hdev->name, hdev->vendor, hdev->product, c->controller_id);
+
+close:
     hid_hw_close(hdev);
     hid_hw_stop(hdev);
 }
 
 static const struct hid_device_id procon_devices[] = {
     { HID_BLUETOOTH_DEVICE(VENDOR_NINTENDO, DEVICE_PROCON) },
+    { HID_BLUETOOTH_DEVICE(VENDOR_NINTENDO, DEVICE_JOYCON_RIGHT) },
+    { HID_BLUETOOTH_DEVICE(VENDOR_NINTENDO, DEVICE_JOYCON_LEFT) },
     { }
 };
 MODULE_DEVICE_TABLE(hid, procon_devices);
@@ -345,7 +718,35 @@ static struct hid_driver procon_hid_driver = {
     .remove = procon_remove_device,
     .raw_event = procon_event,
 };
-module_hid_driver(procon_hid_driver);
+
+// Initialisation of the driver.
+static int __init procon_hid_driver_init(void) {
+    int ret = 0;
+
+    // Register the driver with HID.
+    ret = hid_register_driver(&procon_hid_driver);
+    if (ret != 0) {
+        pr_crit("Cannot register device with HID: %d\n", ret);
+        return ret;
+    }
+
+    // Create some proc entries for user-space controller management.
+    procon_proc_dir = proc_mkdir("procon", NULL);
+
+    return 0;
+}
+
+// Exit of the driver.
+static void __exit procon_hid_driver_exit(void) {
+    if (procon_proc_dir) {
+        proc_remove(procon_proc_dir);
+    }
+
+    hid_unregister_driver(&(procon_hid_driver));
+}
+
+module_init(procon_hid_driver_init);
+module_exit(procon_hid_driver_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Johannes Goor");

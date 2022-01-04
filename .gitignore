@@ -5,3 +5,4 @@
 *.mod.c
 *.cmd
 *.ko
+compile_commands.json

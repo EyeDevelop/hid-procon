@@ -8,8 +8,9 @@
 
 int create_input_device(struct controller *c) {
     char *name;
+    static const size_t name_len = 45;
 
-    name = devm_kzalloc(&c->handler->dev, 42, GFP_KERNEL);
+    name = devm_kzalloc(&c->handler->dev, 45, GFP_KERNEL);
     if (name == NULL) {
         return -ENOMEM;
     }
@@ -19,7 +20,23 @@ int create_input_device(struct controller *c) {
         return -ENOMEM;
     }
 
-    snprintf(name, 42, "Nintendo Switch Pro Controller [player %d]", c->player_id);
+    switch (c->handler->product) {
+        case 0x2006:
+            snprintf(name, name_len, "Nintendo Switch Left JoyCon [controller %d]", c->controller_id);
+            break;
+        
+        case 0x2007:
+            snprintf(name, name_len, "Nintendo Switch Right JoyCon [controller %d]", c->controller_id);
+            break;
+
+        case 0x2009:
+            snprintf(name, name_len, "Nintendo Switch ProCon [controller %d]", c->controller_id);
+            break;
+
+        default:
+            snprintf(name, name_len, "Unknown ProCon device [controller %d]", c->controller_id);
+            break;
+    }
 
     // Setup basic information of the controller.
     c->input->id.bustype = c->handler->bus;
