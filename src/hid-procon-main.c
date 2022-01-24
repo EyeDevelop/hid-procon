@@ -26,7 +26,7 @@
 
 static unsigned int MAX_SUBCMD_RATE_MS = 70;
 
-static bool controller_spots[MAX_CONTROLLER_SUPPORT] = {true};
+static bool controller_spots[MAX_CONTROLLER_SUPPORT] = {};
 struct controller *connected_controllers[MAX_CONTROLLER_SUPPORT] = {NULL, NULL, NULL, NULL};
 
 struct proc_dir_entry *procon_proc_dir = NULL;
@@ -730,8 +730,15 @@ static int __init procon_hid_driver_init(void) {
         return ret;
     }
 
+    // Set all controller slots to available.
+    for (int i = 0; i < MAX_CONTROLLER_SUPPORT; i++) {
+        controller_spots[i] = true;
+    }
+
     // Create some proc entries for user-space controller management.
     procon_proc_dir = proc_mkdir("procon", NULL);
+
+    pr_info("Ready to play!");
 
     return 0;
 }
