@@ -20,17 +20,17 @@
 #include "procon-input.h"
 #include "util.h"
 
-#define MAX_CONTROLLER_SUPPORT 4
+#define MAX_CONTROLLER_SUPPORT 8
 #define MAX_LIGHT_SUPPORT 4
 #define CHARS_NEEDED_FOR_CONTROLLER_ID 1
 
 static unsigned int MAX_SUBCMD_RATE_MS = 70;
 
 static bool controller_spots[MAX_CONTROLLER_SUPPORT] = {};
-struct controller *connected_controllers[MAX_CONTROLLER_SUPPORT] = {NULL, NULL, NULL, NULL};
+struct controller *connected_controllers[MAX_CONTROLLER_SUPPORT] = {};
 
 struct proc_dir_entry *procon_proc_dir = NULL;
-struct proc_dir_entry *procon_player_dirs[MAX_CONTROLLER_SUPPORT] = {NULL, NULL, NULL, NULL};
+struct proc_dir_entry *procon_player_dirs[MAX_CONTROLLER_SUPPORT] = {};
 
 void enforce_baudrate(struct controller *c) {
     unsigned int current_ms = jiffies_to_msecs(jiffies);
@@ -733,6 +733,8 @@ static int __init procon_hid_driver_init(void) {
     // Set all controller slots to available.
     for (int i = 0; i < MAX_CONTROLLER_SUPPORT; i++) {
         controller_spots[i] = true;
+        connected_controllers[i] = NULL;
+        procon_player_dirs[i] = NULL;
     }
 
     // Create some proc entries for user-space controller management.
