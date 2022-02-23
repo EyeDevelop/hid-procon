@@ -9,8 +9,8 @@
 #define __PROCON_CONTROLLER_H__
 
 #define PROCON_STICK_MAX 32767
-#define PROCON_STICK_FUZZ 1000
-#define PROCON_STICK_FLAT 2000
+#define PROCON_STICK_FUZZ 300
+#define PROCON_STICK_FLAT 1500
 
 struct controller {
     struct input_dev *input;
