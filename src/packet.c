@@ -30,29 +30,42 @@ void packet_add_rumble(struct packet *p) {
     memcpy(p->rumble_data, neutral, PACKET_RUMBLE_LENGTH);
 }
 
-__s16 scale_and_clamp_single_stick(const __s16 stick_info) {
-    __s32 val = ((stick_info - 2000) * PROCON_STICK_MAX) / 1500;
+__s16 scale_and_clamp_single_stick(const __s16 stick_info, const struct controller *c, __u8 stick_id) {
+    __s32 center;
+    __s32 min;
+    __s32 max;
+    __s32 val;
 
-    if (val > PROCON_STICK_MAX) {
-        return PROCON_STICK_MAX;
+    if (stick_id == 0) {
+        center = c->ls_center;
+        min = c->ls_min;
+        max = c->ls_max;
+    } else {
+        center = c->rs_center;
+        min = c->rs_min;
+        max = c->rs_max;
     }
 
-    if (val < -PROCON_STICK_MAX) {
-        return -PROCON_STICK_MAX;
+    if (stick_info > center) {
+        val = (stick_info - center) * PROCON_STICK_MAX;
+        val /= (max - center);
+    } else {
+        val = (center - stick_info) * PROCON_STICK_MAX;
+        val /= (center - min);
     }
 
     return (__s16) val;
 }
 
-void scale_and_clamp(struct analog_stick_info *data) {
-    data->left_horizontal = scale_and_clamp_single_stick(data->left_horizontal);
-    data->left_vertical = -scale_and_clamp_single_stick(data->left_vertical);
+void scale_and_clamp(struct analog_stick_info *data, struct controller *c) {
+    data->left_horizontal = scale_and_clamp_single_stick(data->left_horizontal, c, 0);
+    data->left_vertical = -scale_and_clamp_single_stick(data->left_vertical, c, 0);
     
-    data->right_horizontal = scale_and_clamp_single_stick(data->right_horizontal);
-    data->right_vertical = -scale_and_clamp_single_stick(data->right_vertical);
+    data->right_horizontal = scale_and_clamp_single_stick(data->right_horizontal, c, 1);
+    data->right_vertical = -scale_and_clamp_single_stick(data->right_vertical, c, 1);
 }
 
-int decode_advanced_input_report(struct input_response *resp, const __u8 *resp_data, const size_t len) {
+int decode_advanced_input_report(struct input_response *resp, const __u8 *resp_data, const size_t len, struct controller *c) {
     const __u8 *left_data;
     const __u8 *right_data;
 
@@ -109,7 +122,7 @@ int decode_advanced_input_report(struct input_response *resp, const __u8 *resp_d
     resp->stick_data.right_vertical = (right_data[1] >> 4) | (right_data[2] << 4);
 
     // Clamp the stick data after applying the scaling function.
-    scale_and_clamp(&resp->stick_data);
+    scale_and_clamp(&resp->stick_data, c);
 
     return 0;
 }
@@ -182,10 +195,10 @@ int decode_spi_read(__u8 *buf, const __u8 *data, const size_t len) {
     return 0;
 }
 
-int decode_message(struct input_response *resp, const __u8 *resp_data, const size_t len) {
+int decode_message(struct input_response *resp, const __u8 *resp_data, const size_t len, struct controller *c) {
     // Decode the report.
     if (resp_data[0] == 0x21 || resp_data[0] == 0x30) {
-        return decode_advanced_input_report(resp, resp_data, len);
+        return decode_advanced_input_report(resp, resp_data, len, c);
     } else if (resp_data[0] == 0x3F) {
         return decode_simple_input_report(resp, resp_data, len);
     }

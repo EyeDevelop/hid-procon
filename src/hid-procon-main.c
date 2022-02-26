@@ -445,6 +445,7 @@ int procon_init_device(struct hid_device *hdev, const struct hid_device_id *id) 
 
     __u8 handshake[] = {0x80, 0x02};
     __u8 baudrate_increase[] = {0x80, 0x03};
+    __u8 calibration_args[] = {};
     __u8 lpm_read_args[] = {0x00, 0x50, 0x00, 0x00, 0x01};
     __u8 report_mode_args[] = {0x30};
 
@@ -501,6 +502,15 @@ int procon_init_device(struct hid_device *hdev, const struct hid_device_id *id) 
     c->controller_id = controller_id;
     c->player_indicator = 0;
     c->current_packet_num = 0;
+    
+    c->ls_center = CALIBRATION_DEFAULT_CENTER;
+    c->ls_min = CALIBRATION_DEFAULT_MIN;
+    c->ls_max = CALIBRATION_DEFAULT_MAX;
+
+    c->rs_center = CALIBRATION_DEFAULT_CENTER;
+    c->rs_min = CALIBRATION_DEFAULT_MIN;
+    c->rs_max = CALIBRATION_DEFAULT_MAX;
+
     c->handler = hdev;
     hid_set_drvdata(hdev, c);
     connected_controllers[controller_id] = c;
@@ -525,6 +535,14 @@ int procon_init_device(struct hid_device *hdev, const struct hid_device_id *id) 
     ret = send_message(c, &p);
     if (ret < 0) {
         pr_err("Failed to ask for info: %d.\n", ret);
+        goto err_close;
+    }
+
+    // Fetch the current controller calibration.
+    init_packet(&p, PROCON_CMD_COMMAND_AND_RUMBLE, PROCON_SUB_READ_SPI, calibration_args, sizeof(calibration_args));
+    ret = send_message(c, &p);
+    if (ret < 0) {
+        pr_err("Failed to request controller calibration: %d.\n", ret);
         goto err_close;
     }
 
@@ -624,7 +642,7 @@ int procon_event(struct hid_device *hdev, struct hid_report *report, __u8 *raw_d
     c = hid_get_drvdata(hdev);
 
     // Decode the controller message.
-    decode_message(&resp, raw_data, size);
+    decode_message(&resp, raw_data, size, c);
 
     if (resp.subcommand_id == 0x02) {
         mutex_lock(&c->lock);

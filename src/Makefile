@@ -11,7 +11,7 @@ all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(SRC_DIR) modules
 
 compile_commands.json:
-	/usr/bin/python3 /usr/src/linux-headers-$(shell uname -r)/scripts/clang-tools/gen_compile_commands.py -d /lib/modules/$(shell uname -r)/build $(SRC_DIR)
+	/usr/bin/python3 /usr/src/kernels/$(shell uname -r)/scripts/clang-tools/gen_compile_commands.py -d /lib/modules/$(shell uname -r)/build $(SRC_DIR)
 
 load: hid-procon.ko
 	modprobe hid
